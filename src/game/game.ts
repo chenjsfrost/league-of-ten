@@ -14,6 +14,7 @@ import {
 import { CharacterModel, createEnemy, createHero, SWORD_ARC, SWORD_RANGE, type EnemyType } from "./models";
 import { MAX_PLAYERS, type Connection, type Member, type Room } from "./net";
 import { mulberry32, randomSeed } from "./rng";
+import { workerInterval } from "./ticker";
 
 const PLAYER_RADIUS = 0.45;
 const PLAYER_SPEED = 7;
@@ -38,6 +39,11 @@ const HOST_STALL_MS = 3000;
 /** After this long disconnected or with a silent host, offer a way back to the lobby. */
 const OFFER_LEAVE_MS = 15000;
 const FLOOR_ANNOUNCE_INTERVAL = 3;
+
+// Bounds for validating incoming payloads.
+const WORLD_LIMIT = 1000;
+const MAX_FLOOR = 10_000;
+const MAX_MESSAGE_LENGTH = 80;
 
 const ENEMY_TYPES: EnemyType[] = ["skeleton", "brute"];
 const ENEMY_STATS: Record<
@@ -152,6 +158,8 @@ export class Game {
   private disconnectedAt = 0;
   /** performance.now() of the last floor or enemy snapshot from the host. */
   private lastHostMsgAt = 0;
+  /** Host only: when each `${player}:${enemy}` pair last landed a hit. */
+  private readonly lastHitAt = new Map<string, number>();
 
   private netT = 0;
   private idleT = 0;
@@ -201,13 +209,11 @@ export class Game {
 
     // Browsers pause requestAnimationFrame in background tabs. Keep simulating (and, for the host,
     // running the enemies) from a worker timer, which is not throttled like page timers are.
-    const ticker = new Worker(
-      URL.createObjectURL(new Blob(["setInterval(() => postMessage(0), 50)"], { type: "text/javascript" })),
+    this.cleanup.push(
+      workerInterval(() => {
+        if (document.hidden && !this.disposed) this.update(Math.min(0.1, this.clock.getDelta()), false);
+      }, 50),
     );
-    ticker.onmessage = () => {
-      if (document.hidden && !this.disposed) this.update(Math.min(0.1, this.clock.getDelta()), false);
-    };
-    this.cleanup.push(() => ticker.terminate());
   }
 
   dispose() {
@@ -227,24 +233,28 @@ export class Game {
 
   private registerNetHandlers() {
     const room = this.room;
-    const fromHost = (p: { from: string }) => p.from === room.hostId;
+    // `from` is the sender's seat id, which Room has checked against the message signature.
+    // Payload fields are still untrusted, so check their shape and range before using them.
+    const fromHost = (from: string) => from === room.hostId && !room.isHost;
 
-    room.on("p", (p: { id: string; n: string; c: number; x: number; z: number; r: number; hp: number; sw: number }) => {
-      if (!room.members.some((m) => m.id === p.id)) return;
-      let remote = this.remotes.get(p.id);
+    room.on("p", (p, from) => {
+      if (!isNum(p.x, WORLD_LIMIT) || !isNum(p.z, WORLD_LIMIT) || !isNum(p.r, 10) || !isNum(p.hp, MAX_HP) || !Number.isInteger(p.sw)) return;
+      const member = room.members.find((m) => m.id === from);
+      if (!member) return;
+      let remote = this.remotes.get(from);
       if (!remote) {
-        const model = createHero(p.n, p.c);
+        const model = createHero(member.name, member.color);
         model.root.position.set(p.x, 0, p.z);
         this.scene.add(model.root);
         remote = { model, x: p.x, z: p.z, r: p.r, hp: p.hp, swing: p.sw, lastSeen: 0 };
-        this.remotes.set(p.id, remote);
+        this.remotes.set(from, remote);
       }
       if (p.sw !== remote.swing) remote.model.swing();
-      Object.assign(remote, { x: p.x, z: p.z, r: p.r, hp: p.hp, swing: p.sw, lastSeen: performance.now() });
+      Object.assign(remote, { x: p.x, z: p.z, r: p.r, hp: Math.max(0, p.hp), swing: p.sw, lastSeen: performance.now() });
     });
 
-    room.on("floor", (p: { from: string; f: number; s: number }) => {
-      if (!fromHost(p) || room.isHost) return;
+    room.on("floor", (p, from) => {
+      if (!fromHost(from) || !isInt(p.f, 1, MAX_FLOOR) || !isInt(p.s, 0, 0xffffffff)) return;
       this.markHostAlive();
       if (p.f !== this.floor || p.s !== this.seed) this.startFloor(p.f, p.s);
     });
@@ -253,12 +263,13 @@ export class Game {
       if (room.isHost && this.floor > 0) this.announceFloor();
     });
 
-    room.on("e", (p: { from: string; f: number; s: number; l: EnemySnapshot[] }) => {
-      if (!fromHost(p) || room.isHost) return;
+    room.on("e", (p, from) => {
+      if (!fromHost(from)) return;
       this.markHostAlive();
       if (p.f !== this.floor || p.s !== this.seed) return;
+      if (!Array.isArray(p.l) || p.l.length > MAX_ENEMIES || !p.l.every(isEnemySnapshot)) return;
       const seen = new Set<number>();
-      for (const [id, typeIndex, x, z, r, hp, maxHp, windup] of p.l) {
+      for (const [id, typeIndex, x, z, r, hp, maxHp, windup] of p.l as EnemySnapshot[]) {
         seen.add(id);
         const e = this.enemies.get(id);
         const type = ENEMY_TYPES[typeIndex];
@@ -268,20 +279,28 @@ export class Game {
       for (const id of this.enemies.keys()) if (!seen.has(id)) this.enemies.delete(id);
     });
 
-    room.on("hit", (p: { from: string; e: number; d: number; kx: number; kz: number }) => {
-      if (room.isHost) this.applyHit(p.e, p.d, p.kx, p.kz, p.from);
+    room.on("hit", (p, from) => {
+      if (!room.isHost || !Number.isInteger(p.e) || !isNum(p.d, SWORD_DAMAGE * 2) || p.d < 0) return;
+      if (!isNum(p.kx, KNOCKBACK + 0.01) || !isNum(p.kz, KNOCKBACK + 0.01)) return;
+      // A swing hits each enemy at most once, so ignore hits faster than the attack cooldown (with some
+      // slack for network jitter).
+      const key = `${from}:${p.e}`;
+      const now = performance.now();
+      if (now - (this.lastHitAt.get(key) ?? -Infinity) < ATTACK_COOLDOWN * 750) return;
+      this.lastHitAt.set(key, now);
+      this.applyHit(p.e, p.d, p.kx, p.kz, from);
     });
 
-    room.on("ph", (p: { from: string; t: string; d: number }) => {
-      if (fromHost(p) && p.t === room.me.id) this.takeDamage(p.d);
+    room.on("ph", (p, from) => {
+      if (fromHost(from) && p.t === room.me.id && isNum(p.d, MAX_HP) && p.d > 0) this.takeDamage(p.d);
     });
 
-    room.on("kill", (p: { from: string; by: string }) => {
-      if (fromHost(p) && p.by === room.me.id) this.me.kills++;
+    room.on("kill", (p, from) => {
+      if (fromHost(from) && p.by === room.me.id) this.me.kills++;
     });
 
-    room.on("msg", (p: { from: string; text: string }) => {
-      if (fromHost(p)) this.toast(p.text);
+    room.on("msg", (p, from) => {
+      if (fromHost(from) && typeof p.text === "string") this.toast(p.text.slice(0, MAX_MESSAGE_LENGTH));
     });
 
     room.onMembers((members) => this.onMembersChanged(members));
@@ -327,7 +346,7 @@ export class Game {
   }
 
   private requestFloor() {
-    this.room.send("need-floor", { from: this.room.me.id });
+    this.room.send("need-floor", {});
   }
 
   private markHostAlive() {
@@ -335,12 +354,12 @@ export class Game {
   }
 
   private announceFloor() {
-    this.room.send("floor", { from: this.room.me.id, f: this.floor, s: this.seed });
+    this.room.send("floor", { f: this.floor, s: this.seed });
   }
 
   private announce(text: string) {
     this.toast(text);
-    this.room.send("msg", { from: this.room.me.id, text });
+    this.room.send("msg", { text });
   }
 
   // ---------------------------------------------------------------- floors
@@ -560,7 +579,7 @@ export class Game {
       const kz = (dz / (dist || 1)) * KNOCKBACK;
       this.enemyViews.get(e.id)?.model.flash();
       if (this.room.isHost) this.applyHit(e.id, damage, kx, kz, this.room.me.id);
-      else this.room.send("hit", { from: this.room.me.id, e: e.id, d: damage, kx, kz });
+      else this.room.send("hit", { e: e.id, d: damage, kx, kz });
     }
   }
 
@@ -589,7 +608,7 @@ export class Game {
 
     this.enemies.delete(id);
     if (by === this.room.me.id) this.me.kills++;
-    else this.room.send("kill", { from: this.room.me.id, by });
+    else this.room.send("kill", { by });
     if (this.enemies.size === 0 && this.clearedT < 0) {
       this.clearedT = NEXT_FLOOR_DELAY;
       this.announce(`Floor ${this.floor} cleared! Descending…`);
@@ -708,7 +727,7 @@ export class Game {
         e.maxHp,
         e.windup >= 0 ? 1 : 0,
       ]);
-      this.room.send("e", { from: this.room.me.id, f: this.floor, s: this.seed, l });
+      this.room.send("e", { f: this.floor, s: this.seed, l });
     }
 
     this.floorAnnounceT -= dt;
@@ -720,7 +739,7 @@ export class Game {
 
   private damagePlayer(id: string, amount: number) {
     if (id === this.room.me.id) this.takeDamage(amount);
-    else this.room.send("ph", { from: this.room.me.id, t: id, d: amount });
+    else this.room.send("ph", { t: id, d: amount });
   }
 
   /** Breadth-first walking distance (in tiles) from every tile to the nearest player. */
@@ -784,7 +803,7 @@ export class Game {
     if (this.netT > 0) return;
     this.netT = NET_INTERVAL;
     const me = this.me;
-    const p = { id: this.room.me.id, n: this.room.me.name, c: this.room.me.color, x: round2(me.x), z: round2(me.z), r: round2(me.r), hp: me.hp, sw: me.swingCount };
+    const p = { x: round2(me.x), z: round2(me.z), r: round2(me.r), hp: me.hp, sw: me.swingCount };
     const key = `${p.x}|${p.z}|${p.r}|${p.hp}|${p.sw}`;
     if (key === this.lastSentKey && this.idleT > 0) return;
     this.lastSentKey = key;
@@ -974,4 +993,29 @@ function turnToward(current: number, target: number, maxStep: number) {
 
 function round2(n: number) {
   return Math.round(n * 100) / 100;
+}
+
+/** A finite number no further than `limit` from zero. */
+function isNum(v: unknown, limit: number): v is number {
+  return typeof v === "number" && Number.isFinite(v) && Math.abs(v) <= limit;
+}
+
+function isInt(v: unknown, min: number, max: number): v is number {
+  return Number.isInteger(v) && (v as number) >= min && (v as number) <= max;
+}
+
+function isEnemySnapshot(v: unknown): v is EnemySnapshot {
+  if (!Array.isArray(v) || v.length !== 8) return false;
+  const [id, typeIndex, x, z, r, hp, maxHp, windup] = v;
+  return (
+    Number.isInteger(id) &&
+    isInt(typeIndex, 0, ENEMY_TYPES.length - 1) &&
+    isNum(x, WORLD_LIMIT) &&
+    isNum(z, WORLD_LIMIT) &&
+    isNum(r, Number.MAX_VALUE) &&
+    isNum(hp, Number.MAX_VALUE) &&
+    isNum(maxHp, Number.MAX_VALUE) &&
+    maxHp > 0 &&
+    (windup === 0 || windup === 1)
+  );
 }
