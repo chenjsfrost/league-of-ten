@@ -29,6 +29,9 @@ const hud: HudElements = {
   kills: $("kills"),
   death: $("death-overlay"),
   toast: $("toast"),
+  netBanner: $("net-banner"),
+  netText: $("net-text"),
+  netLeave: $<HTMLButtonElement>("net-leave"),
 };
 
 let hero: Hero | null = null;

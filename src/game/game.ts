@@ -12,7 +12,7 @@ import {
   type DungeonData,
 } from "./dungeon";
 import { CharacterModel, createEnemy, createHero, SWORD_ARC, SWORD_RANGE, type EnemyType } from "./models";
-import { MAX_PLAYERS, type Member, type Room } from "./net";
+import { MAX_PLAYERS, type Connection, type Member, type Room } from "./net";
 import { mulberry32, randomSeed } from "./rng";
 import { workerInterval } from "./ticker";
 
@@ -34,6 +34,10 @@ const MAX_ENEMIES = 70;
 // Network pacing. Supabase Realtime bills and rate-limits per message, so keep these modest.
 const NET_INTERVAL = 0.1;
 const IDLE_NET_INTERVAL = 1;
+/** Clients warn once the host has been silent this long (it sends enemies at least every IDLE_NET_INTERVAL). */
+const HOST_STALL_MS = 3000;
+/** After this long disconnected or with a silent host, offer a way back to the lobby. */
+const OFFER_LEAVE_MS = 15000;
 const FLOOR_ANNOUNCE_INTERVAL = 3;
 
 // Bounds for validating incoming payloads.
@@ -100,6 +104,9 @@ export interface HudElements {
   kills: HTMLElement;
   death: HTMLElement;
   toast: HTMLElement;
+  netBanner: HTMLElement;
+  netText: HTMLElement;
+  netLeave: HTMLButtonElement;
 }
 
 export class Game {
@@ -146,6 +153,11 @@ export class Game {
   private flowT = 0;
   private clearedT = -1;
   private wasHost = false;
+  private connection: Connection = "connected";
+  /** performance.now() when the channel last stopped being connected. */
+  private disconnectedAt = 0;
+  /** performance.now() of the last floor or enemy snapshot from the host. */
+  private lastHostMsgAt = 0;
   /** Host only: when each `${player}:${enemy}` pair last landed a hit. */
   private readonly lastHitAt = new Map<string, number>();
 
@@ -181,9 +193,10 @@ export class Game {
   /** Call after room.join() resolves "ok". */
   start() {
     this.wasHost = this.room.isHost;
+    this.markHostAlive();
     if (this.room.isHost) this.startFloor(1, randomSeed());
     else {
-      this.room.send("need-floor", {});
+      this.requestFloor();
       this.toast("Joining the party…");
     }
     this.clock.start();
@@ -213,6 +226,7 @@ export class Game {
     this.model.dispose();
     if (this.dungeonMesh) disposeGroup(this.dungeonMesh);
     window.clearTimeout(this.toastTimer);
+    this.hud.netBanner.hidden = true;
   }
 
   // ---------------------------------------------------------------- networking
@@ -241,6 +255,7 @@ export class Game {
 
     room.on("floor", (p, from) => {
       if (!fromHost(from) || !isInt(p.f, 1, MAX_FLOOR) || !isInt(p.s, 0, 0xffffffff)) return;
+      this.markHostAlive();
       if (p.f !== this.floor || p.s !== this.seed) this.startFloor(p.f, p.s);
     });
 
@@ -249,7 +264,9 @@ export class Game {
     });
 
     room.on("e", (p, from) => {
-      if (!fromHost(from) || p.f !== this.floor || p.s !== this.seed) return;
+      if (!fromHost(from)) return;
+      this.markHostAlive();
+      if (p.f !== this.floor || p.s !== this.seed) return;
       if (!Array.isArray(p.l) || p.l.length > MAX_ENEMIES || !p.l.every(isEnemySnapshot)) return;
       const seen = new Set<number>();
       for (const [id, typeIndex, x, z, r, hp, maxHp, windup] of p.l as EnemySnapshot[]) {
@@ -287,6 +304,20 @@ export class Game {
     });
 
     room.onMembers((members) => this.onMembersChanged(members));
+
+    room.onConnection((connection) => {
+      const was = this.connection;
+      this.connection = connection;
+      if (connection !== "connected") {
+        if (was === "connected") this.disconnectedAt = performance.now();
+      } else if (was !== "connected") {
+        this.toast("Reconnected");
+        // Snapshots couldn't reach us while we were away; give the host a fresh grace period.
+        // If we were the host, the presence sync that follows demotes us and fetches the live floor.
+        this.markHostAlive();
+        if (!room.isHost) this.requestFloor();
+      }
+    });
   }
 
   private onMembersChanged(members: Member[]) {
@@ -306,10 +337,20 @@ export class Game {
       this.toast("You are now the host");
       if (this.enemies.size === 0) this.clearedT = NEXT_FLOOR_DELAY;
     } else if (!isHost && this.wasHost) {
-      // Two players joined an empty room at once and the other one won; adopt their floor.
-      this.room.send("need-floor", {});
+      this.markHostAlive();
+      // Two players joined an empty room at once and the other one won, or we rejoined after a
+      // drop and someone else took over; adopt their floor.
+      this.requestFloor();
     }
     this.wasHost = isHost;
+  }
+
+  private requestFloor() {
+    this.room.send("need-floor", {});
+  }
+
+  private markHostAlive() {
+    this.lastHostMsgAt = performance.now();
   }
 
   private announceFloor() {
@@ -398,6 +439,7 @@ export class Game {
       if (e.code === "Escape") this.onExit();
     });
     listen(window, "keyup", (e) => this.keys.delete(e.code));
+    listen(this.hud.netLeave, "click", () => this.onExit());
     listen(window, "blur", () => {
       this.keys.clear();
       this.mouseDown = false;
@@ -872,6 +914,7 @@ export class Game {
     h.room.textContent = `Room ${this.room.code} · ${this.room.members.length}/${MAX_PLAYERS}`;
     h.enemies.textContent = `Enemies: ${this.enemies.size}`;
     if (me.hp <= 0) h.death.textContent = `You have fallen… respawning in ${Math.ceil(me.deadT)}`;
+    this.updateNetBanner();
 
     h.party.replaceChildren(
       ...this.room.members.map((m) => {
@@ -893,6 +936,25 @@ export class Game {
         return row;
       }),
     );
+  }
+
+  private updateNetBanner() {
+    const problem = this.netProblem(performance.now());
+    const h = this.hud;
+    h.netBanner.hidden = !problem;
+    h.netText.textContent = problem?.text ?? "";
+    h.netLeave.hidden = !problem?.offerLeave;
+  }
+
+  private netProblem(now: number): { text: string; offerLeave: boolean } | null {
+    if (this.connection === "closed") return { text: "Disconnected", offerLeave: true };
+    if (this.connection === "reconnecting") {
+      return { text: "Connection lost, reconnecting…", offerLeave: now - this.disconnectedAt >= OFFER_LEAVE_MS };
+    }
+    if (!this.room.isHost && now - this.lastHostMsgAt > HOST_STALL_MS) {
+      return { text: "Host not responding…", offerLeave: now - this.lastHostMsgAt >= OFFER_LEAVE_MS };
+    }
+    return null;
   }
 
   private toast(text: string) {

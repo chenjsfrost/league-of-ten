@@ -51,6 +51,11 @@ interface Envelope {
 
 type Handler = (payload: any, from: string) => void;
 
+/** "closed" is final: the channel is gone and will not rejoin. */
+export type Connection = "connected" | "reconnecting" | "closed";
+
+const RETRACK_DELAY_MS = 2000;
+
 /**
  * A dungeon room over a Supabase Realtime channel.
  *
@@ -74,6 +79,8 @@ export class Room {
   private handlers = new Map<string, Handler[]>();
   private memberListeners: ((members: Member[]) => void)[] = [];
   private lostListeners: (() => void)[] = [];
+  private connectionListeners: ((connection: Connection) => void)[] = [];
+  private connection: Connection = "reconnecting";
   private membersKey = "";
   private seq = 0;
   private serverOffset = 0;
@@ -107,6 +114,17 @@ export class Room {
   /** Called if the server drops our seat, e.g. because the same account joined from another tab. */
   onLost(listener: () => void) {
     this.lostListeners.push(listener);
+  }
+
+  /** Fires whenever the channel drops, comes back or closes, for the whole life of the room. */
+  onConnection(listener: (connection: Connection) => void) {
+    this.connectionListeners.push(listener);
+  }
+
+  private setConnection(connection: Connection) {
+    if (connection === this.connection || this.connection === "closed" || this.closed) return;
+    this.connection = connection;
+    for (const l of this.connectionListeners) l(connection);
   }
 
   send(event: string, payload: unknown) {
@@ -143,6 +161,7 @@ export class Room {
       this.inbox = this.inbox.then(() => this.receive(payload)).catch(() => {});
     });
 
+    let joined = false;
     const result = await new Promise<"ok" | "error">((resolve) => {
       channel.on("presence", { event: "sync" }, () => {
         this.present = new Set(Object.keys(channel.presenceState()));
@@ -150,15 +169,32 @@ export class Room {
         this.updateMembers();
         if (this.present.has(mine.id)) resolve("ok");
       });
+
+      const track = async () => {
+        const res = await channel.track({ online: true });
+        if (res === "ok") this.setConnection("connected");
+        else if (!joined) resolve("error");
+        else if (!this.closed && channel.state === "joined") window.setTimeout(track, RETRACK_DELAY_MS);
+      };
+
+      // This callback keeps firing after the join: the client rejoins on its own after an error,
+      // and we re-track presence each time so the others see us again. CLOSED never rejoins.
       channel.subscribe(async (status) => {
         if (status === "SUBSCRIBED") {
-          const res = await channel.track({ online: true });
-          if (res !== "ok") resolve("error");
+          // Rejoin as the newest member. Keeping our old join time would make a host that dropped
+          // take the role back from whoever was promoted, and roll the dungeon back to its stale copy.
+          if (joined) await this.rejoin();
+          void track();
         } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
           resolve("error");
+          this.setConnection("reconnecting");
+        } else if (status === "CLOSED") {
+          resolve("error");
+          this.setConnection("closed");
         }
       });
     });
+    joined = result === "ok";
 
     if (result !== "ok") {
       await this.leave();
@@ -174,6 +210,24 @@ export class Room {
     this.stopHeartbeat?.();
     if (this.channel) await supabase.removeChannel(this.channel);
     if (this.me) await supabase.rpc("leave_room", { p_id: this.me.id });
+  }
+
+  /** Move our seat to the back of the host order, after a dropped connection. */
+  private async rejoin() {
+    const { data, error } = await supabase.rpc("room_rejoin", { p_room: this.code, p_id: this.me.id });
+    if (this.closed) return;
+    if (error) {
+      if (error.message === "seat_lost") this.loseSeat();
+      return;
+    }
+    this.applySeats(data);
+    this.updateMembers();
+  }
+
+  private loseSeat() {
+    if (this.lost) return;
+    this.lost = true;
+    for (const l of this.lostListeners) l();
   }
 
   private async receive(raw: unknown) {
@@ -256,10 +310,7 @@ export class Room {
     if (this.closed) return;
     if (error) {
       // Anything else is likely a network blip; the next heartbeat retries.
-      if (error.message === "seat_lost") {
-        this.lost = true;
-        for (const l of this.lostListeners) l();
-      }
+      if (error.message === "seat_lost") this.loseSeat();
       return;
     }
     this.applySeats(data);
