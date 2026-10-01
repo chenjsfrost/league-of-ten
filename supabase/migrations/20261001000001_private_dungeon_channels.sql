@@ -6,7 +6,8 @@
 -- Also required (dashboard, not SQL): Project Settings → Realtime → turn OFF
 -- "Allow public access", so clients can't fall back to public channels.
 
-alter table realtime.messages enable row level security;
+-- RLS is already enabled on realtime.messages, and the table belongs to Supabase, so it can't be
+-- altered here ("must be owner of table messages"). Only the policies are ours to add.
 
 drop policy if exists "dungeon members can receive" on realtime.messages;
 create policy "dungeon members can receive"
