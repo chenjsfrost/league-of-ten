@@ -50,9 +50,17 @@ function onSignedIn(session: Session) {
   show("lobby");
 }
 
+/** 8 letters from a 24-letter alphabet (~1.1e11 codes), drawn with a CSPRNG so they can't be predicted. */
 function randomCode() {
   const letters = "ABCDEFGHJKLMNPQRSTUVWXYZ";
-  return Array.from({ length: 5 }, () => letters[Math.floor(Math.random() * letters.length)]).join("");
+  const out: string[] = [];
+  const buf = new Uint8Array(16);
+  while (out.length < 8) {
+    crypto.getRandomValues(buf);
+    // 240 is the largest multiple of 24 that fits in a byte; skipping bytes above it avoids modulo bias.
+    for (const b of buf) if (b < 240 && out.length < 8) out.push(letters[b % letters.length]);
+  }
+  return out.join("");
 }
 
 joinForm.onsubmit = async (e) => {

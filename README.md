@@ -34,7 +34,12 @@ Clear every enemy on a floor to descend. Each floor is bigger trouble: more enem
 
 ## How multiplayer works
 
-Each dungeon code is a Realtime channel `dungeon:<CODE>`.
+Each dungeon code is a **private** Realtime channel `dungeon:<CODE>`. Only signed-in users can join: access is enforced by RLS policies on `realtime.messages`.
+
+To set this up on your Supabase project:
+
+1. Run `supabase/migrations/20261001000001_private_dungeon_channels.sql` (`supabase db push`, or paste it into the SQL editor).
+2. In **Project Settings → Realtime**, turn off **Allow public access**.
 
 - Joining takes a **seat** from the database (`join_room`). The server assigns the seat id and join time, gives each account one seat per room, and caps the room at 10. Seats stay live through a heartbeat every 5 seconds. A player counts as in the room if they have a live seat and are in the channel's presence.
 - Every message is signed with a key that is generated for the session and registered on its seat. Receivers drop messages that don't verify, replays, messages more than 10 seconds old, and floods. So the only way to act as a player, or as the host, is to hold their seat.
