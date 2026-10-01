@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>League of Ten</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <canvas id="game"></canvas>
+
+    <!-- Sign in / create account -->
+    <section id="auth-screen" class="screen">
+      <div class="panel">
+        <h1>League of Ten</h1>
+        <p class="tagline">Ten heroes. One dungeon.</p>
+        <div class="tabs">
+          <button id="tab-login" class="tab active" type="button">Sign in</button>
+          <button id="tab-signup" class="tab" type="button">Create account</button>
+        </div>
+        <form id="auth-form">
+          <label id="username-field" hidden>
+            Hero name
+            <input id="auth-username" type="text" minlength="3" maxlength="16" autocomplete="nickname" />
+          </label>
+          <label>
+            Email
+            <input id="auth-email" type="email" required autocomplete="email" />
+          </label>
+          <label>
+            Password
+            <input id="auth-password" type="password" required minlength="6" autocomplete="current-password" />
+          </label>
+          <button id="auth-submit" class="primary" type="submit">Sign in</button>
+          <p id="auth-message" class="message"></p>
+        </form>
+      </div>
+    </section>
+
+    <!-- Lobby: pick a room -->
+    <section id="lobby-screen" class="screen" hidden>
+      <div class="panel">
+        <h1>League of Ten</h1>
+        <p class="tagline">Welcome, <strong id="lobby-name"></strong></p>
+        <form id="join-form">
+          <label>
+            Dungeon code
+            <input id="room-code" type="text" maxlength="12" placeholder="e.g. CRYPT" autocomplete="off" />
+          </label>
+          <div class="row">
+            <button class="primary" type="submit">Enter dungeon</button>
+            <button id="random-room" type="button">New code</button>
+          </div>
+          <p class="hint">Share the code with up to 9 friends.</p>
+          <p id="lobby-message" class="message"></p>
+        </form>
+        <button id="logout" class="link" type="button">Sign out</button>
+      </div>
+    </section>
+
+    <!-- In-game HUD -->
+    <section id="hud" hidden>
+      <div id="hud-top">
+        <div id="floor-label">Floor 1</div>
+        <div id="room-label"></div>
+        <div id="enemies-label"></div>
+      </div>
+      <div id="party"></div>
+      <div id="hud-bottom">
+        <div class="bar"><div id="hp-fill"></div><span id="hp-text"></span></div>
+        <div class="bar stamina"><div id="dash-fill"></div></div>
+        <div id="kills">Kills: 0</div>
+      </div>
+      <div id="controls">WASD move · Mouse aim · Click slash · Space dash · Esc leave</div>
+      <div id="death-overlay" hidden>You have fallen… respawning</div>
+      <div id="toast"></div>
+    </section>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
