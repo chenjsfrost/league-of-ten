@@ -23,6 +23,9 @@ export class Room {
   private channel: RealtimeChannel;
   private handlers = new Map<string, Handler[]>();
   private memberListeners: ((members: Member[]) => void)[] = [];
+  private connectionListeners: ((connected: boolean) => void)[] = [];
+  private connected = false;
+  private leaving = false;
 
   constructor(
     readonly code: string,
@@ -53,6 +56,17 @@ export class Room {
 
   onMembers(listener: (members: Member[]) => void) {
     this.memberListeners.push(listener);
+  }
+
+  /** Fires whenever the channel drops or comes back, for the whole life of the room. */
+  onConnection(listener: (connected: boolean) => void) {
+    this.connectionListeners.push(listener);
+  }
+
+  private setConnected(connected: boolean) {
+    if (connected === this.connected || this.leaving) return;
+    this.connected = connected;
+    for (const l of this.connectionListeners) l(connected);
   }
 
   send(event: string, payload: unknown) {
@@ -89,18 +103,23 @@ export class Room {
         for (const l of this.memberListeners) l(this.members);
       });
 
+      // This callback keeps firing after the join: the client rejoins on its own after an error,
+      // and we re-track presence each time so the others see us again.
       this.channel.subscribe(async (status) => {
         if (status === "SUBSCRIBED") {
           const res = await this.channel.track(this.me);
           if (res !== "ok") settle("error");
-        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          else this.setConnected(true);
+        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
           settle("error");
+          this.setConnected(false);
         }
       });
     });
   }
 
   async leave() {
+    this.leaving = true;
     await supabase.removeChannel(this.channel);
   }
 }

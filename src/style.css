@@ -234,6 +234,23 @@ button.link {
 
 #toast.show { opacity: 1; }
 
+#net-banner {
+  position: absolute;
+  top: 100px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.75);
+  pointer-events: auto;
+}
+
+#net-banner[hidden], #net-leave[hidden] { display: none; }
+
 @media (max-width: 600px) {
   #party { display: none; }
   #controls { display: none; }

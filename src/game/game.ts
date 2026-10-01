@@ -33,6 +33,10 @@ const MAX_ENEMIES = 70;
 // Network pacing. Supabase Realtime bills and rate-limits per message, so keep these modest.
 const NET_INTERVAL = 0.1;
 const IDLE_NET_INTERVAL = 1;
+/** Clients warn once the host has been silent this long (it sends enemies at least every IDLE_NET_INTERVAL). */
+const HOST_STALL_MS = 3000;
+/** After this long disconnected or with a silent host, offer a way back to the lobby. */
+const OFFER_LEAVE_MS = 15000;
 const FLOOR_ANNOUNCE_INTERVAL = 3;
 
 const ENEMY_TYPES: EnemyType[] = ["skeleton", "brute"];
@@ -94,6 +98,9 @@ export interface HudElements {
   kills: HTMLElement;
   death: HTMLElement;
   toast: HTMLElement;
+  netBanner: HTMLElement;
+  netText: HTMLElement;
+  netLeave: HTMLButtonElement;
 }
 
 export class Game {
@@ -140,6 +147,10 @@ export class Game {
   private flowT = 0;
   private clearedT = -1;
   private wasHost = false;
+  /** performance.now() when the channel dropped, or -1 while connected. */
+  private disconnectedAt = -1;
+  /** performance.now() of the last floor or enemy snapshot from the host. */
+  private lastHostMsgAt = 0;
 
   private netT = 0;
   private idleT = 0;
@@ -173,6 +184,7 @@ export class Game {
   /** Call after room.join() resolves "ok". */
   start() {
     this.wasHost = this.room.isHost;
+    this.lastHostMsgAt = performance.now();
     if (this.room.isHost) this.startFloor(1, randomSeed());
     else {
       this.room.send("need-floor", { from: this.room.me.id });
@@ -207,6 +219,7 @@ export class Game {
     this.model.dispose();
     if (this.dungeonMesh) disposeGroup(this.dungeonMesh);
     window.clearTimeout(this.toastTimer);
+    this.hud.netBanner.hidden = true;
   }
 
   // ---------------------------------------------------------------- networking
@@ -231,6 +244,7 @@ export class Game {
 
     room.on("floor", (p: { from: string; f: number; s: number }) => {
       if (!fromHost(p) || room.isHost) return;
+      this.lastHostMsgAt = performance.now();
       if (p.f !== this.floor || p.s !== this.seed) this.startFloor(p.f, p.s);
     });
 
@@ -239,7 +253,9 @@ export class Game {
     });
 
     room.on("e", (p: { from: string; f: number; s: number; l: EnemySnapshot[] }) => {
-      if (!fromHost(p) || room.isHost || p.f !== this.floor || p.s !== this.seed) return;
+      if (!fromHost(p) || room.isHost) return;
+      this.lastHostMsgAt = performance.now();
+      if (p.f !== this.floor || p.s !== this.seed) return;
       const seen = new Set<number>();
       for (const [id, typeIndex, x, z, r, hp, maxHp, windup] of p.l) {
         seen.add(id);
@@ -268,6 +284,18 @@ export class Game {
     });
 
     room.onMembers((members) => this.onMembersChanged(members));
+
+    room.onConnection((connected) => {
+      if (connected) {
+        if (this.disconnectedAt >= 0) this.toast("Reconnected");
+        this.disconnectedAt = -1;
+        // Snapshots couldn't reach us while we were away; give the host a fresh grace period.
+        this.lastHostMsgAt = performance.now();
+        if (!room.isHost) room.send("need-floor", { from: room.me.id });
+      } else if (this.disconnectedAt < 0) {
+        this.disconnectedAt = performance.now();
+      }
+    });
   }
 
   private onMembersChanged(members: Member[]) {
@@ -287,6 +315,7 @@ export class Game {
       this.toast("You are now the host");
       if (this.enemies.size === 0) this.clearedT = NEXT_FLOOR_DELAY;
     } else if (!isHost && this.wasHost) {
+      this.lastHostMsgAt = performance.now();
       // Two players joined an empty room at once and the other one won; adopt their floor.
       this.room.send("need-floor", { from: this.room.me.id });
     }
@@ -379,6 +408,7 @@ export class Game {
       if (e.code === "Escape") this.onExit();
     });
     listen(window, "keyup", (e) => this.keys.delete(e.code));
+    listen(this.hud.netLeave, "click", () => this.onExit());
     listen(window, "blur", () => {
       this.keys.clear();
       this.mouseDown = false;
@@ -853,6 +883,7 @@ export class Game {
     h.room.textContent = `Room ${this.room.code} · ${this.room.members.length}/${MAX_PLAYERS}`;
     h.enemies.textContent = `Enemies: ${this.enemies.size}`;
     if (me.hp <= 0) h.death.textContent = `You have fallen… respawning in ${Math.ceil(me.deadT)}`;
+    this.updateNetBanner();
 
     h.party.replaceChildren(
       ...this.room.members.map((m) => {
@@ -874,6 +905,23 @@ export class Game {
         return row;
       }),
     );
+  }
+
+  private updateNetBanner() {
+    const now = performance.now();
+    let text = "";
+    let since = 0;
+    if (this.disconnectedAt >= 0) {
+      text = "Connection lost, reconnecting…";
+      since = this.disconnectedAt;
+    } else if (!this.room.isHost && now - this.lastHostMsgAt > HOST_STALL_MS) {
+      text = "Host not responding…";
+      since = this.lastHostMsgAt;
+    }
+    const h = this.hud;
+    h.netBanner.hidden = !text;
+    h.netText.textContent = text;
+    h.netLeave.hidden = !text || now - since < OFFER_LEAVE_MS;
   }
 
   private toast(text: string) {
