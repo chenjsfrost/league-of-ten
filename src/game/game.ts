@@ -12,7 +12,7 @@ import {
   type DungeonData,
 } from "./dungeon";
 import { CharacterModel, createEnemy, createHero, SWORD_ARC, SWORD_RANGE, type EnemyType } from "./models";
-import { MAX_PLAYERS, type Member, type Room } from "./net";
+import { MAX_PLAYERS, type Connection, type Member, type Room } from "./net";
 import { mulberry32, randomSeed } from "./rng";
 
 const PLAYER_RADIUS = 0.45;
@@ -147,8 +147,9 @@ export class Game {
   private flowT = 0;
   private clearedT = -1;
   private wasHost = false;
-  /** performance.now() when the channel dropped, or -1 while connected. */
-  private disconnectedAt = -1;
+  private connection: Connection = "connected";
+  /** performance.now() when the channel last stopped being connected. */
+  private disconnectedAt = 0;
   /** performance.now() of the last floor or enemy snapshot from the host. */
   private lastHostMsgAt = 0;
 
@@ -184,10 +185,10 @@ export class Game {
   /** Call after room.join() resolves "ok". */
   start() {
     this.wasHost = this.room.isHost;
-    this.lastHostMsgAt = performance.now();
+    this.markHostAlive();
     if (this.room.isHost) this.startFloor(1, randomSeed());
     else {
-      this.room.send("need-floor", { from: this.room.me.id });
+      this.requestFloor();
       this.toast("Joining the party…");
     }
     this.clock.start();
@@ -244,7 +245,7 @@ export class Game {
 
     room.on("floor", (p: { from: string; f: number; s: number }) => {
       if (!fromHost(p) || room.isHost) return;
-      this.lastHostMsgAt = performance.now();
+      this.markHostAlive();
       if (p.f !== this.floor || p.s !== this.seed) this.startFloor(p.f, p.s);
     });
 
@@ -254,7 +255,7 @@ export class Game {
 
     room.on("e", (p: { from: string; f: number; s: number; l: EnemySnapshot[] }) => {
       if (!fromHost(p) || room.isHost) return;
-      this.lastHostMsgAt = performance.now();
+      this.markHostAlive();
       if (p.f !== this.floor || p.s !== this.seed) return;
       const seen = new Set<number>();
       for (const [id, typeIndex, x, z, r, hp, maxHp, windup] of p.l) {
@@ -285,15 +286,17 @@ export class Game {
 
     room.onMembers((members) => this.onMembersChanged(members));
 
-    room.onConnection((connected) => {
-      if (connected) {
-        if (this.disconnectedAt >= 0) this.toast("Reconnected");
-        this.disconnectedAt = -1;
+    room.onConnection((connection) => {
+      const was = this.connection;
+      this.connection = connection;
+      if (connection !== "connected") {
+        if (was === "connected") this.disconnectedAt = performance.now();
+      } else if (was !== "connected") {
+        this.toast("Reconnected");
         // Snapshots couldn't reach us while we were away; give the host a fresh grace period.
-        this.lastHostMsgAt = performance.now();
-        if (!room.isHost) room.send("need-floor", { from: room.me.id });
-      } else if (this.disconnectedAt < 0) {
-        this.disconnectedAt = performance.now();
+        // If we were the host, the presence sync that follows demotes us and fetches the live floor.
+        this.markHostAlive();
+        if (!room.isHost) this.requestFloor();
       }
     });
   }
@@ -315,11 +318,20 @@ export class Game {
       this.toast("You are now the host");
       if (this.enemies.size === 0) this.clearedT = NEXT_FLOOR_DELAY;
     } else if (!isHost && this.wasHost) {
-      this.lastHostMsgAt = performance.now();
-      // Two players joined an empty room at once and the other one won; adopt their floor.
-      this.room.send("need-floor", { from: this.room.me.id });
+      this.markHostAlive();
+      // Two players joined an empty room at once and the other one won, or we rejoined after a
+      // drop and someone else took over; adopt their floor.
+      this.requestFloor();
     }
     this.wasHost = isHost;
+  }
+
+  private requestFloor() {
+    this.room.send("need-floor", { from: this.room.me.id });
+  }
+
+  private markHostAlive() {
+    this.lastHostMsgAt = performance.now();
   }
 
   private announceFloor() {
@@ -908,20 +920,22 @@ export class Game {
   }
 
   private updateNetBanner() {
-    const now = performance.now();
-    let text = "";
-    let since = 0;
-    if (this.disconnectedAt >= 0) {
-      text = "Connection lost, reconnecting…";
-      since = this.disconnectedAt;
-    } else if (!this.room.isHost && now - this.lastHostMsgAt > HOST_STALL_MS) {
-      text = "Host not responding…";
-      since = this.lastHostMsgAt;
-    }
+    const problem = this.netProblem(performance.now());
     const h = this.hud;
-    h.netBanner.hidden = !text;
-    h.netText.textContent = text;
-    h.netLeave.hidden = !text || now - since < OFFER_LEAVE_MS;
+    h.netBanner.hidden = !problem;
+    h.netText.textContent = problem?.text ?? "";
+    h.netLeave.hidden = !problem?.offerLeave;
+  }
+
+  private netProblem(now: number): { text: string; offerLeave: boolean } | null {
+    if (this.connection === "closed") return { text: "Disconnected", offerLeave: true };
+    if (this.connection === "reconnecting") {
+      return { text: "Connection lost, reconnecting…", offerLeave: now - this.disconnectedAt >= OFFER_LEAVE_MS };
+    }
+    if (!this.room.isHost && now - this.lastHostMsgAt > HOST_STALL_MS) {
+      return { text: "Host not responding…", offerLeave: now - this.lastHostMsgAt >= OFFER_LEAVE_MS };
+    }
+    return null;
   }
 
   private toast(text: string) {

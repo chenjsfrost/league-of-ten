@@ -14,6 +14,11 @@ export interface Member {
 
 type Handler = (payload: any) => void;
 
+/** "closed" is final: the channel is gone and will not rejoin. */
+export type Connection = "connected" | "reconnecting" | "closed";
+
+const RETRACK_DELAY_MS = 2000;
+
 /**
  * A dungeon room over a Supabase Realtime channel.
  * Presence tracks who is in the room; the earliest joiner is the host and runs the enemies.
@@ -23,9 +28,10 @@ export class Room {
   private channel: RealtimeChannel;
   private handlers = new Map<string, Handler[]>();
   private memberListeners: ((members: Member[]) => void)[] = [];
-  private connectionListeners: ((connected: boolean) => void)[] = [];
-  private connected = false;
-  private leaving = false;
+  private connectionListeners: ((connection: Connection) => void)[] = [];
+  private connection: Connection = "reconnecting";
+  /** Set once we start leaving, so our own close isn't reported as a dropped connection. */
+  private left = false;
 
   constructor(
     readonly code: string,
@@ -58,15 +64,15 @@ export class Room {
     this.memberListeners.push(listener);
   }
 
-  /** Fires whenever the channel drops or comes back, for the whole life of the room. */
-  onConnection(listener: (connected: boolean) => void) {
+  /** Fires whenever the channel drops, comes back or closes, for the whole life of the room. */
+  onConnection(listener: (connection: Connection) => void) {
     this.connectionListeners.push(listener);
   }
 
-  private setConnected(connected: boolean) {
-    if (connected === this.connected || this.leaving) return;
-    this.connected = connected;
-    for (const l of this.connectionListeners) l(connected);
+  private setConnection(connection: Connection) {
+    if (connection === this.connection || this.connection === "closed" || this.left) return;
+    this.connection = connection;
+    for (const l of this.connectionListeners) l(connection);
   }
 
   send(event: string, payload: unknown) {
@@ -95,6 +101,8 @@ export class Room {
         if (myIndex === -1) return; // our own presence hasn't arrived yet
         if (myIndex >= MAX_PLAYERS) {
           settle("full");
+          // Can also happen mid-game, if the room filled up while we were reconnecting.
+          this.setConnection("closed");
           void this.leave();
           return;
         }
@@ -103,23 +111,34 @@ export class Room {
         for (const l of this.memberListeners) l(this.members);
       });
 
+      const track = async () => {
+        const res = await this.channel.track(this.me);
+        if (res === "ok") this.setConnection("connected");
+        else if (!settled) settle("error");
+        else if (!this.left && this.channel.state === "joined") window.setTimeout(track, RETRACK_DELAY_MS);
+      };
+
       // This callback keeps firing after the join: the client rejoins on its own after an error,
-      // and we re-track presence each time so the others see us again.
-      this.channel.subscribe(async (status) => {
+      // and we re-track presence each time so the others see us again. CLOSED never rejoins.
+      this.channel.subscribe((status) => {
         if (status === "SUBSCRIBED") {
-          const res = await this.channel.track(this.me);
-          if (res !== "ok") settle("error");
-          else this.setConnected(true);
-        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+          // Rejoin as the newest member. Keeping our old joinedAt would make a host that dropped
+          // take the role back from whoever was promoted, and roll the dungeon back to its stale copy.
+          if (settled) this.me.joinedAt = Date.now();
+          void track();
+        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
           settle("error");
-          this.setConnected(false);
+          this.setConnection("reconnecting");
+        } else if (status === "CLOSED") {
+          settle("error");
+          this.setConnection("closed");
         }
       });
     });
   }
 
   async leave() {
-    this.leaving = true;
+    this.left = true;
     await supabase.removeChannel(this.channel);
   }
 }

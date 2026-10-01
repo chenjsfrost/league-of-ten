@@ -249,8 +249,6 @@ button.link {
   pointer-events: auto;
 }
 
-#net-banner[hidden], #net-leave[hidden] { display: none; }
-
 @media (max-width: 600px) {
   #party { display: none; }
   #controls { display: none; }
