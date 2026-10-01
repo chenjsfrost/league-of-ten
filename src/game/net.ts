@@ -57,8 +57,14 @@ export type Connection = "connected" | "reconnecting" | "closed";
 const RETRACK_DELAY_MS = 2000;
 
 /**
- * A dungeon room over a private Supabase Realtime channel.
- * Private channels need a signed-in user: RLS on realtime.messages (supabase/migrations) decides who may join.
+ * Private channels only admit signed-in users, but need the realtime.messages policies from
+ * supabase/migrations/*_private_dungeon_channels.sql and "Allow public access" turned off.
+ * Off until those policies are in place on the project; seats and signatures still apply either way.
+ */
+const PRIVATE_CHANNELS = false;
+
+/**
+ * A dungeon room over a Supabase Realtime channel (private when PRIVATE_CHANNELS is on).
  *
  * The server assigns seats (see join_room in the migration), so nobody can choose their own place in the
  * host order. A member is anyone with a live seat who is also in the channel's presence. Each session signs
@@ -162,7 +168,7 @@ export class Room {
       return "error";
     }
     const channel = supabase.channel(`dungeon:${this.code}`, {
-      config: { private: true, broadcast: { self: false }, presence: { key: mine.id } },
+      config: { private: PRIVATE_CHANNELS, broadcast: { self: false }, presence: { key: mine.id } },
     });
     this.channel = channel;
     channel.on("broadcast", { event: "m" }, ({ payload }) => {
