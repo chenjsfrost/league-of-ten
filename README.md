@@ -32,7 +32,12 @@ Clear every enemy on a floor to descend. Each floor is bigger trouble: more enem
 
 ## How multiplayer works
 
-Each dungeon code is a Realtime channel `dungeon:<CODE>`.
+Each dungeon code is a **private** Realtime channel `dungeon:<CODE>`. Only signed-in users can join: access is enforced by RLS policies on `realtime.messages`.
+
+To set this up on your Supabase project:
+
+1. Run `supabase/migrations/20261001000000_private_dungeon_channels.sql` (`supabase db push`, or paste it into the SQL editor).
+2. In **Project Settings → Realtime**, turn off **Allow public access**.
 
 - The earliest player in the room is the **host** (★ in the party list). The host generates the floor seed, simulates every enemy, and broadcasts enemy snapshots at 10 Hz.
 - Every player broadcasts their own position at up to 10 Hz (1 Hz when idle). Sword hits are sent to the host, which applies damage and knockback.

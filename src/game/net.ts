@@ -15,8 +15,9 @@ export interface Member {
 type Handler = (payload: any) => void;
 
 /**
- * A dungeon room over a Supabase Realtime channel.
+ * A dungeon room over a private Supabase Realtime channel.
  * Presence tracks who is in the room; the earliest joiner is the host and runs the enemies.
+ * Private channels need a signed-in user: RLS on realtime.messages (supabase/migrations) decides who may join.
  */
 export class Room {
   members: Member[] = [];
@@ -29,7 +30,7 @@ export class Room {
     readonly me: Member,
   ) {
     this.channel = supabase.channel(`dungeon:${code}`, {
-      config: { broadcast: { self: false }, presence: { key: me.id } },
+      config: { private: true, broadcast: { self: false }, presence: { key: me.id } },
     });
   }
 
@@ -89,14 +90,19 @@ export class Room {
         for (const l of this.memberListeners) l(this.members);
       });
 
-      this.channel.subscribe(async (status) => {
-        if (status === "SUBSCRIBED") {
-          const res = await this.channel.track(this.me);
-          if (res !== "ok") settle("error");
-        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-          settle("error");
-        }
-      });
+      // Private channels authorize with the user's JWT, so hand Realtime the current session token first.
+      supabase.realtime.setAuth().then(
+        () =>
+          this.channel.subscribe(async (status) => {
+            if (status === "SUBSCRIBED") {
+              const res = await this.channel.track(this.me);
+              if (res !== "ok") settle("error");
+            } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+              settle("error");
+            }
+          }),
+        () => settle("error"),
+      );
     });
   }
 
