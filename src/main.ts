@@ -2,7 +2,6 @@ import * as THREE from "three";
 import type { Session } from "@supabase/supabase-js";
 import { heroFromSession, setupAuthScreen, type Hero } from "./auth";
 import { Game, type HudElements } from "./game/game";
-import { PLAYER_COLORS } from "./game/models";
 import { MAX_PLAYERS, Room } from "./game/net";
 import { supabase } from "./supabase";
 
@@ -30,6 +29,9 @@ const hud: HudElements = {
   kills: $("kills"),
   death: $("death-overlay"),
   toast: $("toast"),
+  netBanner: $("net-banner"),
+  netText: $("net-text"),
+  netLeave: $<HTMLButtonElement>("net-leave"),
 };
 
 let hero: Hero | null = null;
@@ -61,12 +63,6 @@ function randomCode() {
   return out.join("");
 }
 
-function colorFor(userId: string) {
-  let h = 0;
-  for (const ch of userId) h = (h * 31 + ch.charCodeAt(0)) | 0;
-  return PLAYER_COLORS[Math.abs(h) % PLAYER_COLORS.length];
-}
-
 joinForm.onsubmit = async (e) => {
   e.preventDefault();
   if (!hero || game) return;
@@ -79,24 +75,20 @@ joinForm.onsubmit = async (e) => {
   submit.disabled = true;
   lobbyMessage.textContent = "";
 
-  const room = new Room(code, {
-    id: `${hero.id.slice(0, 8)}-${Math.random().toString(36).slice(2, 8)}`,
-    userId: hero.id,
-    name: hero.name,
-    color: colorFor(hero.id),
-    joinedAt: Date.now(),
-  });
-  const g = new Game(renderer, room, hud, leaveGame);
+  const room = new Room(code);
   const result = await room.join();
   submit.disabled = false;
 
   if (result !== "ok") {
-    g.dispose();
     lobbyMessage.textContent =
       result === "full" ? `That dungeon already has ${MAX_PLAYERS} heroes.` : "Could not connect. Try again.";
     return;
   }
-  game = g;
+  room.onLost(() => {
+    leaveGame();
+    lobbyMessage.textContent = "You lost your place in the dungeon. Your account joined from another tab, or the connection dropped for too long.";
+  });
+  game = new Game(renderer, room, hud, leaveGame);
   show("game");
   game.start();
 };
