@@ -2,6 +2,8 @@
 
 A 3D co-op hack-and-slash dungeon crawler for up to 10 players, playable in the browser.
 
+**Play now: https://chenjsfrost.github.io/league-of-ten/**
+
 - **3D** with [Three.js](https://threejs.org): procedurally generated dungeon floors, low-poly heroes, skeletons and brutes.
 - **Accounts** with Supabase Auth (email + password, hero name stored in user metadata).
 - **Multiplayer** with Supabase Realtime: presence tracks who is in a room (capped at 10), and broadcast syncs player and enemy state. No game server to run.
